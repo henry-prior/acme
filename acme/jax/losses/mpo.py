@@ -23,10 +23,12 @@ Tensor shapes are annotated, where helpful, as follow:
   D: dimensionality of the action space.
 """
 
+from enum import Enum
 from typing import NamedTuple, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
+import optax
 import tensorflow_probability
 
 tfp = tensorflow_probability.substrates.jax
@@ -40,12 +42,61 @@ Shape = Tuple[int]
 DType = type(jnp.float32)  # _ScalarMeta, a private type.
 
 
+class TemperatureType(Enum):
+  TEMPERATURE = "temperature"
+  PENALTY_TEMPERATURE = "penalty_temperature"
+
+
+class MPODistributionParams(NamedTuple):
+  """NamedTuple to store lagrange multipliers of policy parameters."""
+  log_alpha_mean: jnp.ndarray
+  log_alpha_stddev: jnp.ndarray
+
+  @classmethod
+  def temperature_mask(cls):
+    return cls(log_alpha_mean=False, log_alpha_stddev=False)
+
+  @classmethod
+  def distribution_parameter_mask(cls):
+    return cls(log_alpha_mean=True, log_alpha_stddev=True)
+
+
 class MPOParams(NamedTuple):
   """NamedTuple to store trainable loss parameters."""
   log_temperature: jnp.ndarray
-  log_alpha_mean: jnp.ndarray
-  log_alpha_stddev: jnp.ndarray
+  distribution_parameters: MPODistributionParams
   log_penalty_temperature: Optional[jnp.ndarray] = None
+
+  @property
+  def log_alpha_mean(self):
+    return self.distribution_parameters.log_alpha_mean
+
+  @property
+  def log_alpha_stddev(self):
+    return self.distribution_parameters.log_alpha_stddev
+
+  @classmethod
+  def temperature_mask(cls):
+    return cls(
+      log_temperature=True,
+      distribution_parameters=MPODistributionParams.temperature_mask(),
+      log_penalty_temperature=True)
+
+  @classmethod
+  def distribution_parameter_mask(cls):
+    # TODO(henry-prior): maybe just `tree_map` `not` onto `temperature_mask`?
+    return cls(
+      log_temperature=False,
+      distribution_parameters=MPODistributionParams.distribution_parameter_mask(),
+      log_penalty_temperature=False)
+
+  def get_temperature_from_type(self, type_: TemperatureType) -> jnp.ndarray:
+    if type_ == TemperatureType.TEMPERATURE:
+      return self.log_temperature
+    elif type_ == TemperatureType.PENALTY_TEMPERATURE:
+      return self.log_penalty_temperature
+    else:
+      raise ValueError(f"{type_} isn't in {list(TemperatureType)}")
 
 
 class MPOStats(NamedTuple):
@@ -95,7 +146,8 @@ class MPO:
                init_log_alpha_stddev: float,
                per_dim_constraining: bool = True,
                action_penalization: bool = True,
-               epsilon_penalty: float = 0.001):
+               epsilon_penalty: float = 0.001,
+               temperature_gradient_steps: int = 3):
     """Initialize and configure the MPO loss.
 
     Args:
@@ -119,6 +171,8 @@ class MPO:
         via the MO-MPO algorithm.
       epsilon_penalty: KL constraint on the probability of violating the action
         constraint.
+      temperature_gradient_steps: number of gradient steps to take on each
+        temperature parameter per epoch
     """
 
     # MPO constrain thresholds.
@@ -138,6 +192,9 @@ class MPO:
 
     # Whether to ensure per-dimension KL constraint satisfication.
     self._per_dim_constraining = per_dim_constraining
+
+    # Number of gradient steps to take on each temperature param per epoch
+    self._temperature_gradient_steps = temperature_gradient_steps
 
   @property
   def per_dim_constraining(self):
@@ -168,8 +225,9 @@ class MPO:
 
     return MPOParams(
         log_temperature=log_temperature,
-        log_alpha_mean=log_alpha_mean,
-        log_alpha_stddev=log_alpha_stddev,
+        distribution_parameters=MPODistributionParams(
+          log_alpha_mean=log_alpha_mean,
+          log_alpha_stddev=log_alpha_stddev),
         log_penalty_temperature=log_penalty_temperature)
 
   def __call__(
@@ -181,6 +239,8 @@ class MPO:
                                         tfd.Independent],
       actions: jnp.ndarray,  # Shape [N, B, D].
       q_values: jnp.ndarray,  # Shape [N, B].
+      dual_optimizer: optax.GradientTransformation,
+      dual_optimizer_state: optax.OptState,
   ) -> Tuple[jnp.ndarray, MPOStats]:
     """Computes the decoupled MPO loss.
 
@@ -224,8 +284,10 @@ class MPO:
     # Compute normalized importance weights, used to compute expectations with
     # respect to the non-parametric policy; and the temperature loss, used to
     # adapt the tempering of Q-values.
-    normalized_weights, loss_temperature = compute_weights_and_temperature_loss(
-        q_values, self._epsilon, temperature)
+    loss_temperature, normalized_weights = accumulate_temperature_sgd_losses(
+      q_values, self._epsilon, params, dual_optimizer, dual_optimizer_state,
+      self._temperature_gradient_steps,
+      temperature_type=TemperatureType.TEMPERATURE)
 
     # Only needed for diagnostics: Compute estimated actualized KL between the
     # non-parametric and current target policies.
@@ -233,17 +295,15 @@ class MPO:
         normalized_weights)
 
     if self._action_penalization:
-      # Transform action penalization temperature.
-      penalty_temperature = jax.nn.softplus(
-          params.log_penalty_temperature) + _MPO_FLOAT_EPSILON
-
       # Compute action penalization cost.
       # Note: the cost is zero in [-1, 1] and quadratic beyond.
       diff_out_of_bound = actions - jnp.clip(actions, -1.0, 1.0)
       cost_out_of_bound = -jnp.linalg.norm(diff_out_of_bound, axis=-1)
 
-      penalty_normalized_weights, loss_penalty_temperature = compute_weights_and_temperature_loss(
-          cost_out_of_bound, self._epsilon_penalty, penalty_temperature)
+      loss_penalty_temperature, penalty_normalized_weights = accumulate_temperature_sgd_losses(
+          cost_out_of_bound, self._epsilon_penalty, params, dual_optimizer,
+          dual_optimizer_state, self._temperature_gradient_steps,
+          temperature_type=TemperatureType.PENALTY_TEMPERATURE)
 
       # Only needed for diagnostics: Compute estimated actualized KL between the
       # non-parametric and current target policies.
@@ -327,7 +387,7 @@ class MPO:
 def compute_weights_and_temperature_loss(
     q_values: jnp.ndarray,
     epsilon: float,
-    temperature: jnp.ndarray,
+    log_temperature: jnp.ndarray,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
   """Computes normalized importance weights for the policy optimization.
 
@@ -345,6 +405,7 @@ def compute_weights_and_temperature_loss(
     Normalized importance weights, used for policy optimization.
     Temperature loss, used to adapt the temperature.
   """
+  temperature = jax.nn.softplus(log_temperature) + _MPO_FLOAT_EPSILON
 
   # Temper the given Q-values using the current temperature.
   tempered_q_values = jax.lax.stop_gradient(q_values) / temperature
@@ -361,6 +422,76 @@ def compute_weights_and_temperature_loss(
   loss_temperature = temperature * loss_temperature
 
   return normalized_weights, loss_temperature
+
+
+def accumulate_temperature_sgd_losses(
+    q_values: jnp.ndarray,
+    epsilon: float,
+    mpo_params: MPOParams,
+    dual_optimizer: optax.GradientTransformation,
+    dual_optimizer_state: optax.OptState,
+    num_steps: int,
+    *,
+    temperature_type: TemperatureType
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+  """Accumulates losses along gradient descent path for temperature parameter.
+
+  Args:
+    q_values: Q-values associates with the actions sampled from the target
+      policy; expected shape [N, B].
+    epsilon: Desired constraint on the KL between the target and non-parameteric
+      policies.
+    mpo_params: Parameters tracking the temperature and dual variables.
+    dual_optimizer: Optimizer object used for temperature and dual variables.
+    dual_optimizer_state: Optimizer state for temperature and dual variables.
+    num_steps: Number of gradient steps to take on the temperature parameter.
+    temperature_type: Indicator for which temperature parameter to optimize,
+      options are `TemperatureType.TEMPERATURE` for the main normalizing
+      temperature and `TemperatureType.PENALTY_TEMPERATURE` for the temperature
+      used in action penalization.
+
+    Returns:
+      Sum of the losses along the gradient descent for the temperature.
+      Normalized non-parametrics weights using the starting temperature.
+  """
+  def _temperature_loss_passthrough(
+      params: MPOParams,
+      update: jnp.ndarray) -> Tuple[float, jnp.ndarray]:
+    normalized_weights_, loss_temperature_ = compute_weights_and_temperature_loss(
+      q_values, epsilon, params.get_temperature_from_type(temperature_type) + update)
+    return jnp.mean(loss_temperature_), normalized_weights_
+
+  # `MPOParams.log_temperature` or `MPOParams.log_penalty_temperature`
+  log_temperature = mpo_params.get_temperature_from_type(temperature_type)
+  total_log_temperature_update = jnp.zeros_like(log_temperature)
+  temperature_value_grad_fn = jax.value_and_grad(_temperature_loss_passthrough,
+                                                 has_aux=True)
+  loss_temperature = 0
+  output_normalized_weights = None
+  # Accumulate losses at each point along the gradient descent. The gradient
+  # transformation at each step is equal to the final gradient update on the
+  # temperature param. In general this assumes that the gradient scalar is
+  # separable with respect to the gradient itself, i.e. that the scalar does
+  # not depend on the gradient.
+  for _ in range(num_steps):
+    (loss_temperature_, normalized_weights_), grad = temperature_value_grad_fn(
+      mpo_params, total_log_temperature_update)
+    # Pass first set of weights using previous step temp for policy param losses
+    if output_normalized_weights is None:
+      output_normalized_weights = normalized_weights_
+    # Keep track of movement along the gradient descent but don't change param
+    # value or update optimizer state. The latter is to make sure that the final
+    # gradient update is equivalent to the cumulative steps here
+    update, _ = dual_optimizer.update(
+      grad, dual_optimizer_state, mpo_params)
+    # If `non_penalty=True` we get the first element, otherwise last. These
+    # correspond to the indices in `MPOParams`
+    total_log_temperature_update += update.get_temperature_from_type(
+      temperature_type)
+    # Accumulate losses at each step
+    loss_temperature += loss_temperature_
+
+  return loss_temperature, output_normalized_weights
 
 
 def compute_nonparametric_kl_from_normalized_weights(
@@ -442,8 +573,9 @@ def compute_parametric_kl_penalty_and_dual_loss(
 def clip_mpo_params(params: MPOParams, per_dim_constraining: bool) -> MPOParams:
   clipped_params = MPOParams(
       log_temperature=jnp.maximum(_MIN_LOG_TEMPERATURE, params.log_temperature),
-      log_alpha_mean=jnp.maximum(_MIN_LOG_ALPHA, params.log_alpha_mean),
-      log_alpha_stddev=jnp.maximum(_MIN_LOG_ALPHA, params.log_alpha_stddev))
+      distribution_parameters=jax.tree_util.tree_map(
+        lambda p: jnp.maximum(_MIN_LOG_ALPHA, p),
+        params.distribution_parameters))
   if not per_dim_constraining:
     return clipped_params
   else:

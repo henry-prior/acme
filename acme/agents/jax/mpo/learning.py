@@ -214,8 +214,8 @@ class MPOLearner(acme.Learner):
 
     # Create optimizers if they aren't given.
     self._optimizer = optimizer or _get_default_optimizer(1e-4, grad_norm_clip)
-    self._dual_optimizer = dual_optimizer or _get_default_optimizer(
-        1e-2, grad_norm_clip)
+    self._dual_optimizer = dual_optimizer or _get_default_dual_optimizer(
+        1e-2, 3e-3, grad_norm_clip)
     self._lr_schedule = learning_rate if callable(learning_rate) else None
 
     self._action_spec = environment_spec.actions
@@ -559,7 +559,9 @@ class MPOLearner(acme.Learner):
       # TODO(bshahr): clean up types: Step is not a great type for sequences.
       sequence: adders.Step,
       target_params: mpo_networks.MPONetworkParams,
-      key: jax_types.PRNGKey) -> Tuple[jnp.ndarray, mpo_types.LogDict]:
+      key: jax_types.PRNGKey,
+      dual_optimizer: optax.GradientTransformation,
+      dual_optimizer_state: optax.OptState) -> Tuple[jnp.ndarray, mpo_types.LogDict]:
     # Compute the model predictions at the root and for the rollouts.
     predictions = self._compute_predictions(params=params, sequence=sequence)
 
@@ -580,7 +582,9 @@ class MPOLearner(acme.Learner):
         online_action_distribution=predictions.policy,  # [T, ...].
         target_action_distribution=targets.policy,  # [T, ...].
         actions=targets.a_improvement,  # Unused in discrete case; [N, T].
-        q_values=targets.q_improvement)  # [N, T]
+        q_values=targets.q_improvement,  # [N, T]
+        dual_optimizer=dual_optimizer,
+        dual_optimizer_state=dual_optimizer_state)
 
     # Compute the critic loss on the states in the sequence.
     critic_loss = self._distributional_loss(
@@ -634,7 +638,7 @@ class MPOLearner(acme.Learner):
     random_key, keys = keys[0], keys[1:]
 
     # Vmap over the batch dimension when learning from sequences.
-    loss_vfn = jax.vmap(self._loss_fn, in_axes=(None, None, 0, None, 0))
+    loss_vfn = jax.vmap(self._loss_fn, in_axes=(None, None, 0, None, 0, None, None))
     safe_mean = lambda x: jnp.mean(x) if x is not None else x
     # TODO(bshahr): Consider cleaning this up via acme.tree_utils.tree_map.
     loss_fn = lambda *a, **k: tree.map_structure(safe_mean, loss_vfn(*a, **k))
@@ -643,7 +647,8 @@ class MPOLearner(acme.Learner):
 
     # Compute the loss and gradient.
     (_, loss_log_dict), all_gradients = loss_and_grad(
-        state.params, state.dual_params, sequences, state.target_params, keys)
+        state.params, state.dual_params, sequences, state.target_params, keys,
+        self._dual_optimizer, state.dual_opt_state)
 
     # Average gradients across replicas.
     gradients, dual_gradients = jax.lax.pmean(all_gradients, _PMAP_AXIS_NAME)
@@ -769,6 +774,24 @@ def _get_default_optimizer(
     learning_rate: float,
     max_grad_norm: Optional[float] = None) -> optax.GradientTransformation:
   optimizer = optax.adam(learning_rate)
+  if max_grad_norm and max_grad_norm > 0:
+    optimizer = optax.chain(optax.clip_by_global_norm(max_grad_norm), optimizer)
+  return optimizer
+
+
+def _get_default_dual_optimizer(
+    learning_rate_distribution: float,
+    learning_rate_temperature: float,
+    max_grad_norm: Optional[float] = None) -> optax.GradientTransformation:
+  temperature_optimizer = optax.sgd(learning_rate_temperature)
+  masked_temperature_optimizer = optax.masked(
+    temperature_optimizer, continuous_losses.MPOParams.temperature_mask())
+  distribution_parameter_optimizer = optax.adam(learning_rate_distribution)
+  masked_distribution_parameter_optimizer = optax.masked(
+    distribution_parameter_optimizer,
+    continuous_losses.MPOParams.distribution_parameter_mask())
+  optimizer = optax.chain(
+    masked_temperature_optimizer, masked_distribution_parameter_optimizer)
   if max_grad_norm and max_grad_norm > 0:
     optimizer = optax.chain(optax.clip_by_global_norm(max_grad_norm), optimizer)
   return optimizer

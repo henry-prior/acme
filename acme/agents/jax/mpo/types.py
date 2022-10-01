@@ -91,6 +91,7 @@ class GaussianPolicyLossConfig:
   init_log_alpha_stddev: float = 1000.
   action_penalization: bool = True
   per_dim_constraining: bool = True
+  temperature_gradient_steps: int = 3
 
 
 @dataclasses.dataclass
